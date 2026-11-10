@@ -1,0 +1,54 @@
+# Two-way sync of master, staging and tags between mytrainingspot/my-training-spot (source of
+# truth) and yoltlabs/my-training-spot (production builds from it), fast-forward only.
+# It lives in this repo so nothing is added to either project repo. Logs name no commits.
+#
+# Secret ORG_SYNC_TOKEN: a classic token with the `repo` and `workflow` scopes from an account
+# that can push to both repos (`workflow` because synced commits may touch .github/workflows).
+# Variable SYNC_DRY_RUN=true keeps every run a dry run.
+# A failed scheduled run means a divergence or a rejected push; GitHub emails the failure.
+
+name: Sync
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only report what would be updated
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Sync
+        env:
+          TOKEN: ${{ secrets.ORG_SYNC_TOKEN }}
+          DRY_RUN: ${{ vars.SYNC_DRY_RUN == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::Secret ORG_SYNC_TOKEN is not set"; exit 1; }
+          git config --global user.name "repo-sync"
+          git config --global user.email "repo-sync@users.noreply.github.com"
+          export SYNC_MINE="https://x-access-token:${TOKEN}@github.com/mytrainingspot/my-training-spot.git"
+          export SYNC_ORG="https://x-access-token:${TOKEN}@github.com/yoltlabs/my-training-spot.git"
+          export SYNC_GIT_DIR="$RUNNER_TEMP/sync.git"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: nothing is pushed."
+            ./repo-sync --dry-run
+          else
+            ./repo-sync
+          fi

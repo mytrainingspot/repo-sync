@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# repo-sync — keeps mytrainingspot/my-training-spot (source of truth: PRs, CI, Linear) and
+# yoltlabs/my-training-spot (production builds from it) identical on master, staging and tags.
+#
+# For each branch: equal → nothing; one side behind → fast-forward it; both ahead → diverged,
+# nothing is pushed and the exit code is 1. Tags missing on one side are copied over; a tag that
+# points at different commits on the two sides is a conflict. Never forces: a push that isn't a
+# fast-forward is rejected by the server. Output names no commits, so logs can be public.
+#
+# Usage:
+#   ./repo-sync [--dry-run]
+#
+# Remotes: $SYNC_MINE and $SYNC_ORG (URLs; default: the two repos over SSH). Objects are cached
+# in $SYNC_GIT_DIR (default ~/.cache/repo-sync.git), fetched only when something differs.
+#
+# Exit code 0 = in sync (or synced), 1 = diverged, conflict or push rejected, 2 = usage error.
+
+set -euo pipefail
+
+BRANCHES=(master staging)
+MINE="${SYNC_MINE:-git@github.com:mytrainingspot/my-training-spot.git}"
+ORG="${SYNC_ORG:-git@github.com:yoltlabs/my-training-spot.git}"
+export GIT_DIR="${SYNC_GIT_DIR:-$HOME/.cache/repo-sync.git}"
+DRY_RUN=0
+PROBLEMS=()
+FETCHED=0
+
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY_RUN=1 ;;
+  *) sed -n '11,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac
+
+[[ -d "$GIT_DIR" ]] || git init --quiet --bare "$GIT_DIR"
+
+# remote_refs <url> — "<sha> <ref>" for the synced branches and every tag (peeled tags skipped).
+remote_refs() {
+  local patterns=() branch
+  for branch in "${BRANCHES[@]}"; do
+    patterns+=("refs/heads/$branch")
+  done
+  git ls-remote "$1" "${patterns[@]}" 'refs/tags/*' | awk '$2 !~ /\^\{\}$/ { print $1, $2 }'
+}
+
+sha_of() {
+  awk -v ref="$2" '$2 == ref { print $1 }' <<<"$1"
+}
+
+# Both sides' branches and tags, so ancestry can be checked and objects pushed across.
+fetch_both() {
+  [[ "$FETCHED" -eq 0 ]] || return 0
+  git fetch --quiet --no-tags "$MINE" '+refs/heads/*:refs/mine/heads/*' '+refs/tags/*:refs/mine/tags/*'
+  git fetch --quiet --no-tags "$ORG" '+refs/heads/*:refs/org/heads/*' '+refs/tags/*:refs/org/tags/*'
+  FETCHED=1
+}
+
+# push <mine|org> <sha> <ref>
+push() {
+  local side="$1" sha="$2" ref="$3" url
+
+  [[ "$side" == mine ]] && url="$MINE" || url="$ORG"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "  would update $side ${ref#refs/*/}"
+    return
+  fi
+
+  if git push --quiet "$url" "$sha:$ref" 2>/dev/null; then
+    echo "  updated $side ${ref#refs/*/}"
+  else
+    PROBLEMS+=("push to $side ${ref#refs/*/} was rejected (it changed meanwhile, or the token lacks access)")
+    echo "  push to $side ${ref#refs/*/} REJECTED"
+  fi
+}
+
+mine_refs="$(remote_refs "$MINE")"
+org_refs="$(remote_refs "$ORG")"
+
+for branch in "${BRANCHES[@]}"; do
+  ref="refs/heads/$branch"
+  mine_sha="$(sha_of "$mine_refs" "$ref")"
+  org_sha="$(sha_of "$org_refs" "$ref")"
+
+  if [[ -z "$mine_sha" || -z "$org_sha" ]]; then
+    PROBLEMS+=("$branch is missing on $([[ -z "$mine_sha" ]] && echo mine || echo org)")
+    echo "$branch: MISSING on one side"
+  elif [[ "$mine_sha" == "$org_sha" ]]; then
+    echo "$branch: in sync"
+  else
+    fetch_both
+    if git merge-base --is-ancestor "$mine_sha" "$org_sha"; then
+      echo "$branch: org is ahead"
+      push mine "$org_sha" "$ref"
+    elif git merge-base --is-ancestor "$org_sha" "$mine_sha"; then
+      echo "$branch: mine is ahead"
+      push org "$mine_sha" "$ref"
+    else
+      PROBLEMS+=("$branch diverged: both repos have commits the other lacks")
+      echo "$branch: DIVERGED"
+    fi
+  fi
+done
+
+copied=0
+while read -r ref; do
+  [[ -n "$ref" ]] || continue
+  mine_sha="$(sha_of "$mine_refs" "$ref")"
+  org_sha="$(sha_of "$org_refs" "$ref")"
+
+  if [[ -z "$org_sha" ]]; then
+    fetch_both
+    push org "$mine_sha" "$ref"
+    copied=$((copied + 1))
+  elif [[ -z "$mine_sha" ]]; then
+    fetch_both
+    push mine "$org_sha" "$ref"
+    copied=$((copied + 1))
+  elif [[ "$mine_sha" != "$org_sha" ]]; then
+    PROBLEMS+=("tag ${ref#refs/tags/} points at different commits in the two repos")
+  fi
+done < <(awk '$2 ~ /^refs\/tags\// { print $2 }' <<<"$mine_refs"$'\n'"$org_refs" | sort -u)
+
+if [[ "$copied" -eq 0 ]]; then
+  echo "tags: in sync"
+elif [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "tags: $copied would be copied"
+else
+  echo "tags: $copied copied"
+fi
+
+if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
+  echo
+  echo "Not synced:"
+  printf -- '- %s\n' "${PROBLEMS[@]}"
+  echo "To resolve a divergence: in the project, git fetch yolt && git switch <branch> && git merge yolt/<branch> && git push origin <branch>; the next run syncs."
+  exit 1
+fi
